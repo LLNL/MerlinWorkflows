@@ -1,0 +1,72 @@
+# LLNL-CONF-771638
+
+description:
+    name: multi_machine
+    description: Run 100 hello worlds on a GPU cluster then again on a CPU cluster, manage allocations as part of the WF. 
+
+batch:
+    type: local
+
+env:
+    variables:
+        OUTPUT_PATH: ./studies
+        GPU_MACHINE: my_gpu_capable_machine 
+        GPU_LAUNCH: alloc 1 merlin run
+        CPU_MACHINE: my_normal_cpu_cluster 
+        CPU_MACHINE_LAUNCH: srun -n 1 --exclusive
+
+    labels:
+        MAKE_SAMPLES: $(SPECROOT)/make_samples.py
+
+study:
+    - name: launch_on_gpu
+      description: |
+         launch a batch allocation for the next step in the workflow
+      run:
+        cmd: |
+          ssh $(GPU_MACHINE) $(GPU_LAUNCH) -W 60 merlin run-workers --steps "['hello_gpu']"
+        procs: 1
+        nodes: 1
+        task_queue: conductor
+
+    - name: hello_gpu
+      description: |
+         process a sample with hello world on a gpu machine
+      run:
+        cmd: |
+          echo "Hello from $SYS_TYPE with sample $(merlin_sample_id):$(X0),$(X1)!" > log.txt
+        procs: 1
+        nodes: 1
+        task_queue: gpu_machine
+        depends: [launch_on_gpu]
+    
+    - name: launch_on_cpu
+      description: |
+         launch a batch allocation for the next step in the workflow
+      run:
+        cmd: |
+          ssh $(CPU_MACHINE) $(CPU_LAUNCH) merlin run-workers --steps "['hello_cpu']"
+        procs: 1
+        nodes: 1
+        task_queue: conductor
+        depends: [hello_gpu*]
+
+    - name: hello_cpu
+      description: |
+         process a sample with hello world on a cpu machine
+      run:
+        cmd: |
+          echo "Hello from $SYS_TYPE with sample $(merlin_sample_id):$(X0),$(X1)!" > log.txt 
+        procs: 1
+        nodes: 1
+        task_queue: cpu_machine 
+        depends: [launch_on_cpu]
+
+merlin:
+    samples:
+        generate:
+            cmd: python $(SPECROOT)/make_samples.py -n 100 -outfile=$(SPECROOT)/samples.npy
+        # can be a file glob of numpy smample files.
+        file: $(SPECROOT)/samples.npy
+        # column labels need to not conflict with maestro parameter labels
+        column_labels: [X0, X1]

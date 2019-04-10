@@ -1,0 +1,163 @@
+####################################################################
+#
+# LLNL-CONF-771638
+#
+# Merlin spec for basic LBANN cycle-gan
+#
+# Targeted for Pascal.
+#
+####################################################################
+
+description:
+    name: ensemble_lbann_cyclegan_jag 
+    description: |
+        generates jag samples, builds an lbann cycle-gan learner, then makes a prediction.
+
+batch:
+    type    : local
+
+env:
+    variables:
+        OUTPUT_PATH: ./studies
+
+    labels:
+        MACHINE: pascal
+        SRUN: srun --mpibind=off --cpu_bind=mask_cpu:0x000001ff,0x0003fe00
+        SHARED_BUILDS: /usr/workspace/wsb/icfsi/lbann/build/gnu.Release.$(MACHINE).llnl.gov/lbann/build/model_zoo
+        BUILD_INDEX: /usr/workspace/wsb/icfsi/for_ben/build/gnu.Release.pascal.llnl.gov/lbann/build/model_zoo/jag_utils/build_index
+        LBANN: $(SHARED_BUILDS)/lbann
+        LBANN_INF: $(SHARED_BUILDS)/lbann_inf
+        JAG: $(SPECROOT)/jag_exe.py
+        PFILE: $(SPECROOT)/jag_params.py
+        FEATURES: $(SPECROOT)/features.json
+        TRANSLATE: $(SPECROOT)/translator.py
+        MAKE_SAMPLES: $(SPECROOT)/make_samples.py
+        DUMP_CONDUIT: $(SPECROOT)/../shared/print_conduit.py
+
+
+study:
+    - name: build
+      description: |
+        build appender.cxx.
+      run:
+         cmd: |
+              cd $(SPECROOT)
+              git submodule update --init .
+              ml cmake/3.8.2
+              cd $(WORKSPACE)
+              cmake -B $(SPECROOT)
+              make all -j 2
+       
+    - name: jag
+      description: |
+         process a sample with jag.
+      run:
+        cmd: |
+          cp $(PFILE) .
+          echo $(STUDY)
+          python $(JAG) --param_file jag_params.py \
+                        --override='{"ablation_cv":$(CVABL),"MShell":$(MSHELL),"radiation_mult":$(RADMULT),"betti_prl15_trans_u":$(U),"betti_prl15_trans_v":$(V),"shape_model_initial_modes:(1,0)":$(MODE_1_0),"shape_model_initial_modes:(2,1)":$(MODE_2_1),"shape_model_initial_modes:(4,3)":$(MODE_4_3)}' --sample_id=$(merlin_sample_id)
+        procs: 1
+        nodes: 1
+
+    - name: append
+      description: |
+         process the output of the jag samples, extracting specific features.
+      run:
+         cmd: |
+             find $(jag.workspace)/*STUDY.$(STUDY) -name results.hdf5 > files_to_append.txt
+             $(build.workspace)/bin/appender $(FEATURES) results_$(STUDY)_features.hdf5 `cat files_to_append.txt`
+         depends: [jag_*,build]
+
+    - name: translate
+      description: |
+          Turn the hdf5 results into a numpy file for later training/ease of use.
+          The variables translated are listed in features_translate.json. This 
+          spec only uses this numpy translation for human-readability.
+      run:
+         cmd: |
+            python $(TRANSLATE) -input $(append.workspace)/results_$(STUDY)_features.hdf5 -output results.npz -schema $(SPECROOT)/features_translate.json
+            python $(DUMP_CONDUIT) $(append.workspace)/results_$(STUDY)_features.hdf5 2>&1 | tee results_$(STUDY)_features.txt
+         depends: [append]
+
+    - name: prep_lbann_data
+      description: |
+          Write index.txt files for LBANN to use to train on the
+          appended JAG results.
+      run:
+          cmd: |
+              $(SRUN) $(BUILD_INDEX) --filelist=$(append.workspace)/files_to_append.txt --base_dir=/ --output_fn=index_train.txt 2>&1 | tee index_train.out
+              $(SRUN) $(BUILD_INDEX) --filelist=$(append.workspace)/files_to_append.txt --base_dir=/ --output_fn=index_test.txt 2>&1 | tee index_test.out
+          depends: [append]
+
+    - name: learn
+      description: |
+         train an lbann cycle-gan learner on the appended JAG results.
+      run:
+        cmd: >
+            $(SRUN)
+            $(LBANN)
+            --this_dir
+            --num_io_threads=1
+            --disable_background_io_activity=1
+            --model=$(SPECROOT)/cyclic_gan_model.prototext 
+            --reader=$(SPECROOT)/data_reader_jag_conduit_lustre.prototext
+            --optimizer=$(SPECROOT)/opt_adam.prototext
+            --metadata=$(SPECROOT)/jag_100M_metadata.prototext
+            --num_epochs=4
+            --data_filedir_train=$(prep_lbann_data.workspace)
+            --index_list_train=index_train.txt
+            2>&1 | tee learn.out
+        depends: [prep_lbann_data]
+
+    - name: predict
+      description: |
+        make a new prediction using the afore-trained lbann cycle-gan model,
+        using JAG results from new samples.
+      run:
+        cmd: >
+            $(SRUN)
+            $(LBANN_INF)
+            --this_dir
+            --num_io_threads=1
+            --disable_background_io_activity=1
+            --model=$(SPECROOT)/cyclic_gan_model_inf.prototext 
+            --reader=$(SPECROOT)/data_reader_jag_conduit_lustre_inf.prototext
+            --optimizer=$(SPECROOT)/opt_adam.prototext
+            --metadata=$(SPECROOT)/jag_100M_metadata.prototext
+            --num_epochs=4
+            --data_filedir_train=$(prep_lbann_data.workspace)
+            --data_filedir_test=$(prep_lbann_data.workspace)
+            --index_list_train=index_train.txt
+            --index_list_test=index_test.txt
+            --ckpt_dir=$(learn.workspace)
+            2>&1 | tee predict.out
+        depends: [learn]
+
+global.parameters:
+    STUDY:
+        values : [JAG]
+        label  : STUDY.%%
+    CVABL:
+        values : [0.5]
+        label  : CVABL.%%
+    MSHELL:
+        values : [50]
+        label  : MSHELL.%%
+    RADMULT:
+        values : [1.0]
+        label  : RADMULT.%%
+    N_NEW:
+        values : [100]
+        label  : N_NEW.%%
+
+merlin:
+    samples:
+        generate:
+            # This creates the samples.npy file with samples in it, scaled between (min,max,scale_function) in the corresponding directions 
+            cmd: python $(SPECROOT)/make_samples.py -dims 5 -n 5000 -outfile=$(SPECROOT)/samples.npy -scale "[(0,1,'linear'),(0,1,'linear'),(-0.3,0.3,'linear'),(-0.3,0.3,'linear'),(-0.3,0.3,'linear')]"
+        # can be a file glob of numpy sample files.
+        file: $(SPECROOT)/samples.npy
+        # column labels need to not conflict with maestro parameter labels
+        column_labels: [U, V, MODE_1_0, MODE_2_1, MODE_4_3]
+

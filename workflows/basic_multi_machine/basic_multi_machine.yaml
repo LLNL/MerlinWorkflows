@@ -1,0 +1,47 @@
+# LLNL-CONF-771638
+
+description:
+    name: basic_ensemble
+    description: Run 100 hello worlds on a GPU cluster then a CPU cluster.
+
+batch:
+    type: local
+
+env:
+    variables:
+        OUTPUT_PATH: ./studies
+
+    labels:
+        MAKE_SAMPLES: $(SPECROOT)/make_samples.py
+
+study:
+
+    - name: hello_gpu
+      description: |
+         process a sample with hello world on a gpu machine
+      run:
+        cmd: |
+          echo "Hello from $SYS_TYPE with sample $(merlin_sample_id):$(X0),$(X1)!" > log.txt
+        procs: 1
+        nodes: 1
+        task_queue: gpu_machine
+
+    - name: hello_cpu
+      description: |
+         process a sample with hello world on a cpu machine
+      run:
+        cmd: |
+          echo "Hello from $SYS_TYPE with sample $(merlin_sample_id):$(X0),$(X1)!" > log.txt 
+        procs: 1
+        nodes: 1
+        task_queue: cpu_machine 
+        depends: [hello_gpu]
+
+merlin:
+    samples:
+        generate:
+            cmd: python $(SPECROOT)/make_samples.py -n 100 -outfile=$(SPECROOT)/samples.npy
+        # can be a file glob of numpy smample files.
+        file: $(SPECROOT)/samples.npy
+        # column labels need to not conflict with maestro parameter labels
+        column_labels: [X0, X1]
